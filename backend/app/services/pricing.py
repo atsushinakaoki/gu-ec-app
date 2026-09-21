@@ -167,6 +167,20 @@ def calc_tax(taxable_ex_tax: int) -> int:
     return int((Decimal(taxable_ex_tax) * TAX_RATE).to_integral_value(rounding=ROUND_FLOOR))
 
 
+def tax_included_unit_price(price_ex_tax: int) -> int:
+    """表示用の税込単価（1点あたり、1円未満切捨て）。
+
+    消費税法63条の総額表示義務により、商品の価格は税込で表示する。
+    画面側で計算させないのは、端数処理を1か所に集約するため。
+
+    注意：この値の合計は、注文の総額と1円ずれることがある。
+    注文では税を「注文単位で1回」算出するため（DS-393）。
+    1,999円（税込2,198円）を2点買うと、表示からの計算は 4,396円、
+    注文の総額は 4,397円 になる。テスト仕様書【未確定5】の論点である。
+    """
+    return price_ex_tax + calc_tax(price_ex_tax)
+
+
 def calc_order_amount(
     *,
     items: list[LineItem],

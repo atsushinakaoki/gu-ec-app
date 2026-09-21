@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db, to_utc_iso
-from app.deps import get_optional_member
+from app.deps import get_optional_member, require_member
 from app.models import CartItem, Member, Product, Reservation, Sku
 from app.schemas import (
     AddCartItemRequest,
@@ -20,6 +20,8 @@ from app.schemas import (
     CartAmountView,
     CartItemView,
     CartResponse,
+    DiscardedLineView,
+    MergeCartResponse,
     ReservationInfo,
 )
 from app.services import cart_service, pricing
@@ -79,6 +81,9 @@ def add_cart_item(
             type=item.alteration_type,
             lengthMm=item.alteration_length_mm,
             fee=pricing.resolve_alteration_fee(item.alteration_type),
+            feeTaxIncluded=pricing.tax_included_unit_price(
+                pricing.resolve_alteration_fee(item.alteration_type)
+            ),
         )
 
     return AddCartItemResponse(
@@ -121,9 +126,12 @@ def get_cart(
         ).scalars()
     )
     reserved_qty: dict[int, int] = {}
+    earliest: dict[int, object] = {}
     for r in reservations:
         if ReservationState(r.status, r.expires_at).is_active(now):
             reserved_qty[r.cart_item_id] = reserved_qty.get(r.cart_item_id, 0) + r.quantity
+            if r.cart_item_id not in earliest or r.expires_at < earliest[r.cart_item_id]:
+                earliest[r.cart_item_id] = r.expires_at
 
     views: list[CartItemView] = []
     line_items: list[pricing.LineItem] = []
@@ -145,6 +153,9 @@ def get_cart(
                 type=item.alteration_type,
                 lengthMm=item.alteration_length_mm,
                 fee=pricing.resolve_alteration_fee(item.alteration_type),
+            feeTaxIncluded=pricing.tax_included_unit_price(
+                pricing.resolve_alteration_fee(item.alteration_type)
+            ),
             )
         views.append(
             CartItemView(
@@ -156,9 +167,15 @@ def get_cart(
                 size=sku.size,
                 quantity=item.quantity,
                 unitPrice=unit_price,
+                unitPriceTaxIncluded=pricing.tax_included_unit_price(unit_price),
                 priceType=price_type,
                 alteration=alteration,
                 reserved=reserved_qty.get(item.cart_item_id, 0) >= item.quantity,
+                reservedUntil=(
+                    to_utc_iso(earliest[item.cart_item_id])
+                    if item.cart_item_id in earliest
+                    else None
+                ),
             )
         )
         line_items.append(
@@ -214,3 +231,32 @@ def delete_cart_item(
         raise
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/merge", response_model=MergeCartResponse)
+def merge_cart(
+    response: Response,
+    db: Session = Depends(get_db),
+    member: Member = Depends(require_member),
+    gu_cart_session: str | None = Cookie(default=None, alias=CART_SESSION_COOKIE),
+) -> MergeCartResponse:
+    """ログイン直後に呼ぶ。未ログインで入れた商品を会員のカートへ移す（設計仕様書 4.2.2）。"""
+    try:
+        discarded = cart_service.merge_guest_cart(db, member, gu_cart_session)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    # 統合が済んだ未ログインのカートの識別子は、もう使わない
+    response.delete_cookie(CART_SESSION_COOKIE)
+    return MergeCartResponse(
+        discarded=[
+            DiscardedLineView(
+                productName=d.product_name,
+                colorName=d.color_name,
+                size=d.size,
+                alterationLengthMm=d.alteration_length_mm,
+            )
+            for d in discarded
+        ]
+    )

@@ -24,6 +24,10 @@ class ProductListItem(ApiModel):
     member_price: int | None = Field(default=None, alias="memberPrice")
     applied_price: int = Field(alias="appliedPrice")
     applied_price_type: str = Field(alias="appliedPriceType")
+    # 総額表示（消費税法63条）。画面にはこちらを主として表示する
+    regular_price_tax_included: int = Field(alias="regularPriceTaxIncluded")
+    member_price_tax_included: int | None = Field(default=None, alias="memberPriceTaxIncluded")
+    applied_price_tax_included: int = Field(alias="appliedPriceTaxIncluded")
 
 
 class ProductListResponse(ApiModel):
@@ -44,6 +48,7 @@ class SkuAvailability(ApiModel):
 class AlterationOption(ApiModel):
     type: str
     fee: int
+    fee_tax_included: int = Field(alias="feeTaxIncluded")
     min_length_mm: int | None = Field(default=None, alias="minLengthMm")
     max_length_mm: int | None = Field(default=None, alias="maxLengthMm")
     step_mm: int = Field(default=5, alias="stepMm")
@@ -57,6 +62,10 @@ class ProductDetailResponse(ApiModel):
     member_price: int | None = Field(default=None, alias="memberPrice")
     applied_price: int = Field(alias="appliedPrice")
     applied_price_type: str = Field(alias="appliedPriceType")
+    # 総額表示（消費税法63条）。画面にはこちらを主として表示する
+    regular_price_tax_included: int = Field(alias="regularPriceTaxIncluded")
+    member_price_tax_included: int | None = Field(default=None, alias="memberPriceTaxIncluded")
+    applied_price_tax_included: int = Field(alias="appliedPriceTaxIncluded")
     alterable: bool
     alteration_options: list[AlterationOption] | None = Field(
         default=None, alias="alterationOptions"
@@ -82,6 +91,7 @@ class AlterationDetail(ApiModel):
     type: str
     length_mm: int = Field(alias="lengthMm")
     fee: int  # 1点あたりの加工料（税抜）
+    fee_tax_included: int = Field(alias="feeTaxIncluded")
 
 
 class ReservationInfo(ApiModel):
@@ -105,10 +115,13 @@ class CartItemView(ApiModel):
     size: str
     quantity: int
     unit_price: int = Field(alias="unitPrice")
+    unit_price_tax_included: int = Field(alias="unitPriceTaxIncluded")
     price_type: str = Field(alias="priceType")
     alteration: AlterationDetail | None = None
     # 引当が期限切れになっている明細は、注文時に改めて在庫を取り直す
     reserved: bool
+    # 有効な引当のうち、最も早く切れるものの期限（UTC）。引当が無ければ null
+    reserved_until: str | None = Field(default=None, alias="reservedUntil")
 
 
 class CartAmountView(ApiModel):
@@ -122,6 +135,18 @@ class CartResponse(ApiModel):
     amount: CartAmountView
 
 
+class DiscardedLineView(ApiModel):
+    product_name: str = Field(alias="productName")
+    color_name: str = Field(alias="colorName")
+    size: str
+    alteration_length_mm: int | None = Field(default=None, alias="alterationLengthMm")
+
+
+class MergeCartResponse(ApiModel):
+    # DS-425: 統合により破棄した明細。顧客に表示する
+    discarded: list[DiscardedLineView]
+
+
 # --- 購入手続き ---------------------------------------------------------
 
 
@@ -129,6 +154,7 @@ class DeliveryMethodOption(ApiModel):
     code: str
     name: str
     fee: int  # 送料（税抜）。現在のカートの内容で算出する
+    fee_tax_included: int = Field(alias="feeTaxIncluded")
     available: bool
     unavailable_reason: str | None = Field(default=None, alias="unavailableReason")
 
@@ -167,6 +193,7 @@ class PaymentMethodOption(ApiModel):
     code: str
     name: str
     fee: int
+    fee_tax_included: int = Field(alias="feeTaxIncluded")
     available: bool
     unavailable_reason: UnavailableReasonView | None = Field(
         default=None, alias="unavailableReason"

@@ -1,0 +1,159 @@
+:root {
+  --ink: #1a1a1a;
+  --ink-2: #555;
+  --ink-3: #8a8a8a;
+  --line: #e3e3e0;
+  --bg: #ffffff;
+  --bg-2: #f6f6f4;
+  --accent: #1f3a63;
+  --accent-ink: #ffffff;
+  --member: #b3261e;
+  --warn-bg: #fff7e6;
+  --warn-line: #f0c36d;
+  --error-bg: #fdecea;
+  --error-line: #e8a39c;
+  --ok-bg: #edf7ee;
+  --ok-line: #9fcfa3;
+  --radius: 6px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+a { color: inherit; }
+button { font: inherit; }
+
+.container { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+
+/* --- ヘッダ --- */
+.header { border-bottom: 1px solid var(--line); background: var(--bg); position: sticky; top: 0; z-index: 10; }
+.header-inner { display: flex; align-items: center; justify-content: space-between; height: 60px; gap: 12px; }
+.brand { font-weight: 700; letter-spacing: 0.04em; text-decoration: none; font-size: 18px; }
+.brand small { font-weight: 400; color: var(--ink-3); font-size: 11px; margin-left: 8px; letter-spacing: 0; }
+.nav { display: flex; gap: 16px; align-items: center; font-size: 14px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .brand small { display: none; }
+  .nav { gap: 12px; font-size: 13px; }
+  .nav .muted { display: none; }
+}
+.nav a { text-decoration: none; }
+.nav a:hover { text-decoration: underline; }
+.badge { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--ink); color: #fff; font-size: 12px; text-align: center; margin-left: 4px; }
+
+/* .container の padding（左右）と打ち消し合わないよう、上下だけを指定する */
+main.container { padding-top: 24px; padding-bottom: 64px; }
+h1 { font-size: 22px; margin: 0 0 16px; }
+h2 { font-size: 17px; margin: 28px 0 12px; }
+
+/* --- 共通部品 --- */
+.btn {
+  display: inline-block; border: 1px solid var(--ink); background: var(--ink); color: #fff;
+  padding: 12px 20px; border-radius: var(--radius); cursor: pointer; text-decoration: none;
+  text-align: center; font-weight: 600;
+}
+.btn:disabled { background: #c9c9c6; border-color: #c9c9c6; color: #fff; cursor: not-allowed; }
+.btn-secondary { background: #fff; color: var(--ink); }
+.btn-block { display: block; width: 100%; }
+.btn-link { background: none; border: none; color: var(--accent); text-decoration: underline; cursor: pointer; padding: 0; }
+
+.notice { border: 1px solid var(--line); background: var(--bg-2); padding: 12px 14px; border-radius: var(--radius); font-size: 14px; margin: 12px 0; }
+.notice-warn { background: var(--warn-bg); border-color: var(--warn-line); }
+.notice-error { background: var(--error-bg); border-color: var(--error-line); }
+.notice-ok { background: var(--ok-bg); border-color: var(--ok-line); }
+
+.muted { color: var(--ink-2); font-size: 13px; }
+.small { font-size: 12px; color: var(--ink-3); }
+
+.field { margin: 12px 0; }
+.field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.field input, .field select {
+  width: 100%; padding: 10px 12px; border: 1px solid #c9c9c6; border-radius: var(--radius); font: inherit; background: #fff;
+}
+
+/* --- 価格 --- */
+.price { font-weight: 700; }
+.price-member { color: var(--member); }
+.price-regular-struck { color: var(--ink-3); text-decoration: line-through; font-weight: 400; margin-right: 6px; }
+.tax-note { font-size: 11px; color: var(--ink-3); font-weight: 400; margin-left: 2px; }
+.member-tag { display: inline-block; font-size: 11px; border: 1px solid var(--member); color: var(--member); padding: 0 6px; border-radius: 3px; margin-right: 6px; vertical-align: 1px; }
+
+/* --- 商品一覧 --- */
+.filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.chip { border: 1px solid #c9c9c6; background: #fff; padding: 6px 14px; border-radius: 999px; cursor: pointer; font-size: 13px; }
+.chip[aria-pressed="true"] { background: var(--ink); color: #fff; border-color: var(--ink); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 20px 16px; }
+.card { text-decoration: none; display: block; }
+.card-img { aspect-ratio: 3 / 4; border-radius: var(--radius); background: var(--bg-2); display: flex; align-items: flex-end; justify-content: center; padding: 12px; gap: 6px; }
+.card-name { font-size: 14px; margin: 8px 0 2px; }
+.dot { width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.15); }
+
+/* --- 商品詳細 --- */
+.detail { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+@media (max-width: 760px) { .detail { grid-template-columns: 1fr; } }
+.detail-img {
+  aspect-ratio: 3 / 4; border-radius: var(--radius); background: var(--bg-2);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+}
+.detail-img .garment { width: 42%; aspect-ratio: 3 / 4; border-radius: 10px 10px 4px 4px; border: 1px solid rgba(0,0,0,0.12); }
+@media (max-width: 760px) { .detail-img { aspect-ratio: 4 / 3; } .detail-img .garment { width: 26%; } }
+.option-label { font-size: 13px; font-weight: 600; margin: 20px 0 8px; }
+.option-label span { font-weight: 400; color: var(--ink-2); margin-left: 8px; }
+.swatches { display: flex; gap: 10px; flex-wrap: wrap; }
+.swatch {
+  width: 40px; height: 40px; border-radius: 50%; cursor: pointer; border: 1px solid rgba(0,0,0,0.2);
+  position: relative; padding: 0;
+}
+.swatch[aria-pressed="true"] { outline: 2px solid var(--ink); outline-offset: 3px; }
+.swatch:disabled { cursor: not-allowed; opacity: 0.45; }
+.sizes { display: flex; gap: 8px; flex-wrap: wrap; }
+.size {
+  min-width: 56px; padding: 10px 12px; border: 1px solid #c9c9c6; border-radius: var(--radius);
+  background: #fff; cursor: pointer; position: relative; overflow: hidden;
+}
+.size[aria-pressed="true"] { border-color: var(--ink); border-width: 2px; padding: 9px 11px; font-weight: 700; }
+/* 在庫切れは斜線を引いて選べなくする（要件定義書 5.3 の観察事実） */
+.size:disabled, .swatch.soldout { cursor: not-allowed; color: var(--ink-3); background: #fafafa; }
+.size:disabled::after, .swatch.soldout::after {
+  content: ""; position: absolute; left: -10%; top: 50%; width: 120%; border-top: 1px solid #b5b5b1;
+  transform: rotate(-24deg);
+}
+.alteration { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-top: 8px; }
+.radio-row { display: flex; gap: 16px; flex-wrap: wrap; margin: 4px 0 8px; }
+.radio-row label { display: flex; align-items: center; gap: 6px; font-size: 14px; cursor: pointer; }
+select:disabled { background: #f0f0ee; color: var(--ink-3); }
+
+/* --- カート・確認 --- */
+.lines { border-top: 1px solid var(--line); }
+.line { display: grid; grid-template-columns: 64px 1fr auto; gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--line); align-items: start; }
+.line-img { width: 64px; aspect-ratio: 3 / 4; border-radius: 4px; }
+.line-name { font-weight: 600; font-size: 14px; }
+.line-meta { font-size: 13px; color: var(--ink-2); }
+.line-right { text-align: right; font-size: 14px; }
+.layout-2col { display: grid; grid-template-columns: 1fr 320px; gap: 32px; align-items: start; }
+@media (max-width: 760px) { .layout-2col { grid-template-columns: 1fr; } }
+.summary-box { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; background: var(--bg-2); position: sticky; top: 76px; }
+.amount-row { display: flex; justify-content: space-between; font-size: 14px; padding: 3px 0; }
+.amount-total { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 10px; font-size: 17px; font-weight: 700; }
+
+/* --- 配送・支払 --- */
+.choice {
+  display: flex; gap: 10px; align-items: flex-start; border: 1px solid #c9c9c6; border-radius: var(--radius);
+  padding: 12px 14px; margin: 8px 0; cursor: pointer; background: #fff;
+}
+.choice.selected { border-color: var(--ink); border-width: 2px; padding: 11px 13px; }
+.choice.unavailable { background: #f7f7f5; color: var(--ink-3); cursor: not-allowed; }
+.choice input { margin-top: 4px; }
+.choice-main { flex: 1; }
+.choice-fee { font-size: 13px; color: var(--ink-2); white-space: nowrap; }
+.reason { font-size: 13px; color: #8a4b00; margin-top: 4px; }
+.section { border-top: 1px solid var(--line); padding-top: 4px; }
+.step { font-size: 12px; color: var(--ink-3); letter-spacing: 0.08em; }

@@ -79,6 +79,13 @@ def list_products(
                 ),
                 appliedPrice=unit_price,
                 appliedPriceType=price_type,
+                regularPriceTaxIncluded=pricing.tax_included_unit_price(p.regular_price),
+                memberPriceTaxIncluded=(
+                    pricing.tax_included_unit_price(member_price_active)
+                    if member_price_active != p.regular_price
+                    else None
+                ),
+                appliedPriceTaxIncluded=pricing.tax_included_unit_price(unit_price),
             )
         )
 
@@ -144,6 +151,7 @@ def get_product(
             AlterationOption(
                 type=alteration_type,
                 fee=fee,
+                feeTaxIncluded=pricing.tax_included_unit_price(fee),
                 # DS-311: 加工可能な最短の丈は商品ごとに持つ
                 minLengthMm=product.min_alteration_length_mm,
                 maxLengthMm=product.original_length_mm,
@@ -162,6 +170,13 @@ def get_product(
         ),
         appliedPrice=unit_price,
         appliedPriceType=price_type,
+        regularPriceTaxIncluded=pricing.tax_included_unit_price(product.regular_price),
+        memberPriceTaxIncluded=(
+            pricing.tax_included_unit_price(member_price_active)
+            if member_price_active != product.regular_price
+            else None
+        ),
+        appliedPriceTaxIncluded=pricing.tax_included_unit_price(unit_price),
         alterable=product.alterable,
         alterationOptions=alteration,
         skus=sku_items,

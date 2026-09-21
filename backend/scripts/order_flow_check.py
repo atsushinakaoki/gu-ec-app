@@ -372,6 +372,46 @@ def scenario_expiry() -> None:
     check("TC-IT-EX-03", "在庫は変わらない", stock(LAST) == 1, stock(LAST))
 
 
+def scenario_merge() -> None:
+    print("\n5.8 未ログインカートの統合")
+    reset()
+    # 会員として、すそ上げ700mmのパンツを2点入れておく
+    member_session = login(MEMBER_A[0])
+    add(member_session, PANTS, 2, {"type": "SINGLE_FOLD", "lengthMm": 700})
+
+    # 別の端末で、ログインせずにカートへ入れる
+    guest = TestClient(app)
+    add(guest, PLENTY, 1)
+    add(guest, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 700})  # 会員側と同じ明細
+    add(guest, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 650})  # 丈が違う＝別の明細
+    guest_expiry = scalar(
+        "SELECT MIN(expires_at) FROM reservation WHERE sku_id = :s AND status = 'ACTIVE'", s=PLENTY
+    )
+
+    # その端末でログインし、統合する
+    res = guest.post("/api/auth/login", json={"email": MEMBER_A[0], "password": PASSWORD})
+    assert res.status_code == 200, res.text
+    merged = guest.post("/api/cart/merge")
+    check("TC-IT-MG", "統合が成功する", merged.status_code == 200, merged.text)
+    discarded = merged.json().get("discarded", [])
+    check("DS-425", "破棄した明細（同じ丈のパンツ1件）を返す",
+          len(discarded) == 1 and discarded[0]["alterationLengthMm"] == 700, discarded)
+
+    cart = guest.get("/api/cart").json()["items"]
+    lines = sorted((i["skuId"], (i["alteration"] or {}).get("lengthMm"), i["quantity"]) for i in cart)
+    check("DS-424", "同じ明細は合算せず会員側（2点）を残す", (PANTS, 700, 2) in lines, lines)
+    check("DS-428", "丈が違う明細は別物として移る", (PANTS, 650, 1) in lines, lines)
+    check("TC-IT-MG", "未ログインの別商品も移る", (PLENTY, None, 1) in lines, lines)
+    released = scalar(
+        "SELECT COUNT(*) FROM reservation WHERE sku_id = :s AND status = 'RELEASED'", s=PANTS
+    )
+    check("DS-426", "破棄した明細の引当を解放する", released == 1, released)
+    after = scalar(
+        "SELECT MIN(expires_at) FROM reservation WHERE sku_id = :s AND status = 'ACTIVE'", s=PLENTY
+    )
+    check("DS-427", "ログインで引当期限を延ばさない", after == guest_expiry, (guest_expiry, after))
+
+
 def main() -> None:
     print("注文確定の結合テスト（Azure MySQL に接続して実行）")
     try:
@@ -380,6 +420,7 @@ def main() -> None:
         scenario_decline()
         scenario_timeout()
         scenario_expiry()
+        scenario_merge()
     finally:
         restore()
 

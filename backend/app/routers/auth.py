@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app import config
 from app.db import get_db
-from app.deps import ACCESS_TOKEN_COOKIE, require_member
+from app.deps import ACCESS_TOKEN_COOKIE, get_optional_member, require_member
 from app.models import Member
 from app.schemas import ApiModel
 from app.services.errors import AuthenticationError
@@ -89,4 +89,24 @@ def logout(response: Response) -> Response:
 def me(member: Member = Depends(require_member)) -> MemberResponse:
     return MemberResponse(
         member_id=member.member_id, name=member.name, email=member.email
+    )
+
+
+class SessionResponse(ApiModel):
+    member: MemberResponse | None
+
+
+@router.get("/session", response_model=SessionResponse)
+def session(member: Member | None = Depends(get_optional_member)) -> SessionResponse:
+    """ログイン状態の確認。未ログインでも 200 を返す。
+
+    /me は未ログインなら 401 を返す（それが意味として正しい）。
+    ただ画面は表示のたびにログイン状態を確かめるので、/me を使うと
+    未ログインの利用者のブラウザに 401 のエラーが毎回記録される。
+    「ログインしていないこと」は異常ではないので、別の窓口を設ける。
+    """
+    if member is None:
+        return SessionResponse(member=None)
+    return SessionResponse(
+        member=MemberResponse(member_id=member.member_id, name=member.name, email=member.email)
     )

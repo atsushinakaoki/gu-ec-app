@@ -59,6 +59,7 @@ def _payment_options(delivery_method: str, placement_type: str | None) -> list[P
                 name=checkout_service.PAYMENT_NAMES[opt.code],
                 # 手数料は選択前に示す（要件定義書 FR-563-02）
                 fee=pricing.resolve_payment_fee(opt.code),
+                feeTaxIncluded=pricing.tax_included_unit_price(pricing.resolve_payment_fee(opt.code)),
                 available=opt.available,
                 unavailableReason=reason,
             )
@@ -95,6 +96,7 @@ def get_options(
             code=code,
             name=name,
             fee=pricing.resolve_shipping_fee(code, subtotal),
+            feeTaxIncluded=pricing.tax_included_unit_price(pricing.resolve_shipping_fee(code, subtotal)),
             available=True,
             unavailableReason=None,
         )

@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app import config
@@ -51,6 +52,7 @@ from app.services.errors import (
     StockInsufficientError,
     ValidationError,
 )
+from app.services.reservation import ReservationState
 from app.services.stock import STATUS_ACTIVE, can_reserve
 
 MAX_QUANTITY_PER_ITEM = 10  # schema.sql の chk_cart_item_quantity と対応
@@ -94,6 +96,87 @@ def get_or_create_cart(
     db.add(cart)
     db.flush()
     return cart, new_session_id
+
+
+# --- カートの統合 -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DiscardedLine:
+    product_name: str
+    color_name: str
+    size: str
+    alteration_length_mm: int | None
+
+
+def merge_guest_cart(db: Session, member: Member, session_id: str | None) -> list[DiscardedLine]:
+    """未ログインのカートを会員のカートへ統合する（設計仕様書 4.2.2）。
+
+    戻り値は、統合により破棄した明細（DS-425: 顧客に知らせるため）。
+    この関数はコミットしない。
+
+    規則:
+      - 会員のカートが無ければ、未ログインのカートをそのまま会員のものにする
+      - 同じ明細（sku + 加工方法 + 丈。DS-428）が両方にあれば、会員側を残す（DS-424）
+        合算しないのは、合算すると追加の引当が必要になり、
+        「ログインしたら在庫不足のエラーが出た」が起こりうるため
+      - 破棄する明細の引当は解放する（DS-426）
+      - 引当の期限は延ばさない（DS-427）。明細を移すだけで reservation には触れない
+    """
+    if not session_id:
+        return []
+    guest = db.execute(
+        select(Cart).where(Cart.session_id == session_id, Cart.member_id.is_(None))
+    ).scalar_one_or_none()
+    if guest is None:
+        return []
+
+    member_cart = db.execute(
+        select(Cart).where(Cart.member_id == member.member_id)
+    ).scalar_one_or_none()
+
+    if member_cart is None:
+        guest.member_id = member.member_id
+        guest.session_id = None
+        db.flush()
+        return []
+
+    member_items = list(
+        db.execute(select(CartItem).where(CartItem.cart_id == member_cart.cart_id)).scalars()
+    )
+    member_keys = {(i.sku_id, i.alteration_type, i.alteration_length_mm) for i in member_items}
+    count = len(member_items)
+
+    guest_items = list(
+        db.execute(select(CartItem).where(CartItem.cart_id == guest.cart_id)).scalars()
+    )
+    discarded: list[DiscardedLine] = []
+    for item in guest_items:
+        key = (item.sku_id, item.alteration_type, item.alteration_length_mm)
+        if key in member_keys or count >= MAX_ITEMS_PER_CART:
+            sku = db.get(Sku, item.sku_id)
+            product = db.get(Product, sku.product_id)
+            discarded.append(
+                DiscardedLine(product.name, sku.color_name, sku.size, item.alteration_length_mm)
+            )
+            for r in db.execute(
+                select(Reservation).where(Reservation.cart_item_id == item.cart_item_id)
+            ).scalars():
+                state = ReservationState(r.status, r.expires_at)
+                state.release()
+                r.status, r.expires_at = state.status, state.expires_at
+            db.execute(delete(CartItem).where(CartItem.cart_item_id == item.cart_item_id))
+        else:
+            item.cart_id = member_cart.cart_id
+            member_keys.add(key)
+            count += 1
+
+    db.flush()
+    # ORM の cascade（Cart.items の delete-orphan）を通すと、移したはずの明細まで
+    # メモリ上の関連に残っていて一緒に消える。SQL で直接、空のカートだけを消す
+    db.execute(delete(Cart).where(Cart.cart_id == guest.cart_id))
+    db.expunge(guest)
+    return discarded
 
 
 # --- 入力値の検証 -------------------------------------------------------
