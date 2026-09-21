@@ -152,3 +152,4 @@ venv/
 # ì‹Æ’†‚Ìˆêƒtƒ@ƒCƒ‹
 backend_v*/
 backend_v*.zip
+!.env.local.example
