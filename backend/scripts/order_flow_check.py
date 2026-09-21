@@ -1,0 +1,393 @@
+"""注文確定の結合テスト（テスト仕様書 5.3〜5.7、5.9）。
+
+本物の DB（Azure MySQL）に対して、注文確定の一連の流れを検証する。
+テスト仕様書 8.3.1 のとおり、DB はモックに置き換えない。
+
+アプリケーションはこのスクリプトの中で直接動かす（FastAPI の TestClient）。
+uvicorn の起動は不要。決済代行事業者（PSP）はスタブであり、
+成功・否決・タイムアウトを環境変数で切り替える。同じプロセスの中なので、
+サーバを再起動せずに切り替えられる。
+
+--- 時刻の扱い（テスト仕様書 8.4.3 TE-01） ---
+
+引当の期限切れを再現するには60分待つ必要がある。
+DB の時計は進められないので、代わりに引当の expires_at を過去の時刻に書き換える。
+「時間を進める」のではなく「期限を手前にずらす」ことで同じ状態を作る。
+
+--- 使い方 ---
+
+    cd backend
+    python scripts/order_flow_check.py
+
+会員1・会員2の注文とカートを消してから始める。
+使う SKU の在庫は、終了時に seed.sql の値へ戻す。
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+import threading
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+
+from app.db import engine  # noqa: E402
+from app.main import app  # noqa: E402
+from app.services import payment_gateway  # noqa: E402
+
+# 使う SKU と、seed.sql における在庫数（終了時に戻す）
+PLENTY = "360416-00-M"  # ドライポンチクルーネックT。在庫 99
+PANTS = "360411-09-M"  # スーパーワイドカーゴパンツ。すそ上げ可（800mm / 下限400mm）。在庫 40
+LAST = "360417-09-S"  # シアーハイネックT。検証のため在庫を 1 にして使う。元は 12
+ORIGINAL_STOCK = {PLENTY: 99, PANTS: 40, LAST: 12}
+
+MEMBER_A = ("test1@example.com", 1)
+MEMBER_B = ("test2@example.com", 2)
+PASSWORD = "Passw0rd!"
+
+RECIPIENT = {
+    "name": "テスト 太郎",
+    "postalCode": "070-0031",
+    "address": "北海道旭川市一条通1丁目1-1",
+    "phone": "090-0000-0001",
+}
+
+results: list[tuple[str, bool]] = []
+
+
+# --- 準備と後片付け -----------------------------------------------------
+
+
+def sql(statement: str, **params):
+    with engine.begin() as conn:
+        return conn.execute(text(statement), params)
+
+
+def scalar(statement: str, **params):
+    with engine.connect() as conn:
+        return conn.execute(text(statement), params).scalar()
+
+
+def reset(last_stock: int = 1) -> None:
+    """会員1・2の注文とカートを消し、使う SKU の在庫を既知の値にする。"""
+    members = "(1, 2)"
+    skus = (PLENTY, PANTS, LAST)
+    sql(
+        f"""DELETE FROM reservation
+            WHERE sku_id IN (:a, :b, :c)
+               OR order_id IN (SELECT order_id FROM orders WHERE member_id IN {members})""",
+        a=skus[0], b=skus[1], c=skus[2],
+    )
+    sql(f"DELETE FROM order_item WHERE order_id IN (SELECT order_id FROM orders WHERE member_id IN {members})")
+    sql(f"DELETE FROM orders WHERE member_id IN {members}")
+    sql(f"DELETE FROM cart_item WHERE cart_id IN (SELECT cart_id FROM cart WHERE member_id IN {members})")
+    sql(f"DELETE FROM checkout WHERE cart_id IN (SELECT cart_id FROM cart WHERE member_id IN {members})")
+    sql("UPDATE stock SET quantity = :q WHERE sku_id = :s AND location_id = 1", q=ORIGINAL_STOCK[PLENTY], s=PLENTY)
+    sql("UPDATE stock SET quantity = :q WHERE sku_id = :s AND location_id = 1", q=ORIGINAL_STOCK[PANTS], s=PANTS)
+    sql("UPDATE stock SET quantity = :q WHERE sku_id = :s AND location_id = 1", q=last_stock, s=LAST)
+    payment_gateway.reset()
+    os.environ["PSP_STUB_MODE"] = "success"
+
+
+def restore() -> None:
+    reset(last_stock=ORIGINAL_STOCK[LAST])
+
+
+# --- 操作 ---------------------------------------------------------------
+
+
+def login(email: str) -> TestClient:
+    client = TestClient(app)
+    res = client.post("/api/auth/login", json={"email": email, "password": PASSWORD})
+    assert res.status_code == 200, res.text
+    return client
+
+
+def add(client: TestClient, sku: str, qty: int = 1, alteration: dict | None = None):
+    body = {"skuId": sku, "quantity": qty}
+    if alteration:
+        body["alteration"] = alteration
+    res = client.post("/api/cart/items", json=body)
+    assert res.status_code == 201, res.text
+    return res.json()
+
+
+def checkout(client: TestClient, delivery="HOME", placement="NONE", payment="CREDIT_CARD") -> dict:
+    res = client.post(
+        "/api/checkout/delivery",
+        json={"deliveryMethod": delivery, "placementType": placement, "recipient": RECIPIENT},
+    )
+    assert res.status_code == 200, res.text
+    res = client.post("/api/checkout/payment", json={"paymentMethod": payment})
+    assert res.status_code == 200, res.text
+    res = client.get("/api/checkout/summary")
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
+def order(client: TestClient, summary: dict, key: str | None = None, total: int | None = None):
+    return client.post(
+        "/api/orders",
+        json={"expectedTotal": summary["amounts"]["total"] if total is None else total},
+        headers={"Idempotency-Key": key or summary["idempotencyKey"]},
+    )
+
+
+def stock(sku: str) -> int:
+    return scalar("SELECT quantity FROM stock WHERE sku_id = :s AND location_id = 1", s=sku)
+
+
+def orders_count(member_id: int = 1, status: str | None = None) -> int:
+    if status:
+        return scalar(
+            "SELECT COUNT(*) FROM orders WHERE member_id = :m AND status = :st", m=member_id, st=status
+        )
+    return scalar("SELECT COUNT(*) FROM orders WHERE member_id = :m", m=member_id)
+
+
+def reservation_statuses(order_number: str) -> list[str]:
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """SELECT r.status FROM reservation r
+                   JOIN orders o ON o.order_id = r.order_id
+                   WHERE o.order_number = :n ORDER BY r.status"""
+            ),
+            {"n": order_number},
+        ).all()
+    return [r[0] for r in rows]
+
+
+def cart_count(member_id: int = 1) -> int:
+    return scalar(
+        """SELECT COUNT(*) FROM cart_item ci JOIN cart c ON c.cart_id = ci.cart_id
+           WHERE c.member_id = :m""",
+        m=member_id,
+    )
+
+
+def check(test_id: str, label: str, condition: bool, detail: object = "") -> None:
+    results.append((test_id, bool(condition)))
+    mark = "✔" if condition else "✘"
+    print(f"  {mark} {test_id} {label}" + ("" if condition else f"\n      → {detail}"))
+
+
+# --- シナリオ -----------------------------------------------------------
+
+
+def scenario_success() -> None:
+    print("\n5.3 注文確定・決済成功")
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 2, {"type": "SINGLE_FOLD", "lengthMm": 700})
+    before = stock(PANTS)
+    summary = checkout(a)
+    res = order(a, summary)
+    check("TC-IT-OK-01", "201 が返る", res.status_code == 201, res.text)
+    number = res.json().get("orderNumber", "")
+    check("TC-IT-OK-01", "在庫が注文数量ぶん減る", stock(PANTS) == before - 2, (before, stock(PANTS)))
+    check("TC-IT-OK-01", "引当が CONFIRMED", reservation_statuses(number) == ["CONFIRMED"], reservation_statuses(number))
+    check("TC-IT-OK-01", "注文が CONFIRMED", orders_count(1, "CONFIRMED") == 1)
+    tx = scalar("SELECT payment_transaction_id FROM orders WHERE order_number = :n", n=number)
+    check("TC-IT-OK-01", "取引IDが保存される", bool(tx), tx)
+    check("TC-IT-OK-01", "カートが空になる", cart_count(1) == 0, cart_count(1))
+    call = payment_gateway.calls()[-1]
+    check("TC-IT-OK-10", "PSP への金額が Backend の算出額と一致", call[1] == summary["amounts"]["total"], call)
+    check("TC-IT-OK-11", "PSP に注文番号が送られる", call[0] == number, call)
+
+    # 注文時点の値のコピー
+    sql("UPDATE product SET name = CONCAT(name, '（改）'), regular_price = regular_price + 1000 WHERE product_id = '360411'")
+    try:
+        detail = a.get(f"/api/orders/{number}").json()
+        item = detail["items"][0]
+        check("TC-IT-OK-20", "商品の価格を変えても注文の金額は変わらない", detail["amounts"]["total"] == summary["amounts"]["total"], detail["amounts"])
+        check("TC-IT-OK-21", "商品名を変えても注文の商品名は変わらない", "（改）" not in item["productName"], item["productName"])
+    finally:
+        sql("UPDATE product SET name = REPLACE(name, '（改）', ''), regular_price = regular_price - 1000 WHERE product_id = '360411'")
+
+    # 二重送信（成功後の再送）
+    again = order(a, summary)
+    check("TC-IT-ID-01", "同じキーの再送は最初の結果を返す", again.status_code == 201 and again.json().get("orderNumber") == number, again.text)
+    check("TC-IT-ID-10", "決済の要求は1回だけ", len([c for c in payment_gateway.calls() if c[0] == number]) == 1)
+    check("TC-IT-ID-12", "注文は1件だけ", orders_count(1) == 1)
+
+    # 他人の注文
+    b = login(MEMBER_B[0])
+    check("TC-IT-AZ-01", "他人の注文は 404", b.get(f"/api/orders/{number}").status_code == 404)
+    check("TC-IT-AZ-20", "他人の注文と存在しない注文で応答が同一",
+          b.get(f"/api/orders/{number}").json() == b.get("/api/orders/GU000000XXXXXXXX").json())
+
+
+def scenario_idempotency() -> None:
+    print("\n5.6 注文確定の二重送信")
+    # ID-04: 同じキーで内容が違う
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 700})
+    summary = checkout(a)
+    res = order(a, summary, key="it-id04-key")
+    assert res.status_code == 201, res.text
+    add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 650})  # 金額は同じ、丈だけ違う
+    checkout(a)
+    res = order(a, summary, key="it-id04-key")
+    check("TC-IT-ID-04", "同じキー・異なる内容は 422", res.status_code == 422, res.text)
+
+    # ID-05: 違うキー・同じ内容
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PLENTY)
+    r1 = order(a, checkout(a))
+    add(a, PLENTY)
+    r2 = order(a, checkout(a))
+    check("TC-IT-ID-05", "違うキーなら2件の注文", r1.status_code == 201 and r2.status_code == 201 and orders_count(1) == 2)
+
+    # ID-02: 同じキー・同じ内容を同時に送る。
+    # タイミングに依存する不具合を1回で捕まえられるとは限らないため、5回繰り返す
+    # （実際に、1回目の実装はここで 422 を返すことがあった）
+    rounds_ok = 0
+    all_codes = []
+    for _ in range(5):
+        reset()
+        a1, a2 = login(MEMBER_A[0]), login(MEMBER_A[0])  # 同じ会員。同じカートを見る
+        add(a1, PLENTY, 2)
+        summary = checkout(a1)
+        before = stock(PLENTY)
+        barrier = threading.Barrier(2)
+        codes: list[int] = []
+
+        def fire(client: TestClient) -> None:
+            barrier.wait()
+            codes.append(order(client, summary).status_code)
+
+        threads = [threading.Thread(target=fire, args=(c,)) for c in (a1, a2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        all_codes.append(sorted(codes))
+        rounds_ok += (
+            orders_count(1) == 1
+            and stock(PLENTY) == before - 2
+            and sorted(codes)[0] == 201
+            and set(codes) <= {201, 409}
+        )
+    check("TC-IT-ID-02", "同時送信を5回。いずれも注文1件・減算1回・応答は201と(201か409)",
+          rounds_ok == 5, all_codes)
+
+    # 金額の改ざん
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PLENTY)
+    summary = checkout(a)
+    before = stock(PLENTY)
+    res = order(a, summary, total=1)
+    check("DS-628", "金額が違えば 422", res.status_code == 422, res.text)
+    check("DS-629", "正しい金額を応答に含めない", str(summary["amounts"]["total"]) not in res.text, res.text)
+    check("DS-628", "在庫は変わらない", stock(PLENTY) == before)
+
+
+def scenario_decline() -> None:
+    print("\n5.4 注文確定・決済失敗")
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 2)
+    before = stock(PANTS)
+    summary = checkout(a)
+    os.environ["PSP_STUB_MODE"] = "decline"
+    res = order(a, summary)
+    check("TC-IT-NG-01", "402 が返る", res.status_code == 402, res.text)
+    number = scalar("SELECT order_number FROM orders WHERE member_id = 1")
+    check("TC-IT-NG-01", "在庫が元に戻る", stock(PANTS) == before, (before, stock(PANTS)))
+    check("TC-IT-NG-01", "引当が RELEASED", reservation_statuses(number) == ["RELEASED"], reservation_statuses(number))
+    check("TC-IT-NG-01", "注文が FAILED", orders_count(1, "FAILED") == 1)
+    check("TC-IT-NG-01", "カートは残る", cart_count(1) == 1, cart_count(1))
+
+    os.environ["PSP_STUB_MODE"] = "success"
+    res = order(a, checkout(a, payment="PAYPAY"))
+    check("TC-IT-NG-02", "支払方法を変えて再試行すると成立", res.status_code == 201, res.text)
+    check("TC-IT-NG-02", "在庫の減算は1回ぶんだけ", stock(PANTS) == before - 2, (before, stock(PANTS)))
+
+
+def scenario_timeout() -> None:
+    print("\n5.5 決済のタイムアウト")
+    for mode, test_id, final in (
+        ("timeout_then_success", "TC-IT-TO-02", "CONFIRMED"),
+        ("timeout_then_decline", "TC-IT-TO-03", "FAILED"),
+    ):
+        reset()
+        a = login(MEMBER_A[0])
+        add(a, PANTS, 2)
+        before = stock(PANTS)
+        summary = checkout(a)
+        os.environ["PSP_STUB_MODE"] = mode
+        res = order(a, summary)
+        number = res.json().get("orderNumber", "")
+        if mode == "timeout_then_success":
+            check("TC-IT-TO-01", "202 が返る（失敗扱いにしない）", res.status_code == 202, res.text)
+            check("TC-IT-TO-01", "在庫は減ったまま", stock(PANTS) == before - 2)
+            check("TC-IT-TO-01", "注文は PENDING_PAYMENT", orders_count(1, "PENDING_PAYMENT") == 1)
+            check("TC-IT-TO-01", "引当は CONFIRMED のまま", reservation_statuses(number) == ["CONFIRMED"], reservation_statuses(number))
+            blocked = a.post("/api/orders", json={"expectedTotal": 1}, headers={"Idempotency-Key": "another"})
+            check("【未確定13】", "決済待ちの間は新しい注文を受け付けない（暫定）", blocked.status_code == 409, blocked.text)
+        detail = a.get(f"/api/orders/{number}").json()
+        expected_stock = before - 2 if final == "CONFIRMED" else before
+        check(test_id, f"照会の結果、注文が {final} になる", detail.get("status") == final, detail)
+        check(test_id, "在庫が正しい", stock(PANTS) == expected_stock, (expected_stock, stock(PANTS)))
+
+
+def scenario_expiry() -> None:
+    print("\n5.7 引当期限切れ後の注文")
+
+    # 最後の1点を自分が引き当てている（変異テストで見逃したため追加）
+    reset(last_stock=1)
+    a = login(MEMBER_A[0])
+    add(a, LAST)
+    res = order(a, checkout(a))
+    check("LAST-01", "在庫1を自分が引当済みなら注文できる", res.status_code == 201, res.text)
+
+    # EX-02: 期限切れ。在庫はある
+    reset(last_stock=1)
+    a = login(MEMBER_A[0])
+    add(a, LAST)
+    summary = checkout(a)
+    sql("UPDATE reservation SET expires_at = NOW() - INTERVAL 1 SECOND WHERE sku_id = :s AND status = 'ACTIVE'", s=LAST)
+    res = order(a, summary)
+    check("TC-IT-EX-02", "期限切れでも在庫があれば成立", res.status_code == 201, res.text)
+    check("TC-IT-EX-02", "在庫 1 → 0", stock(LAST) == 0, stock(LAST))
+
+    # EX-03: 期限切れ。その間に他人が確保した
+    reset(last_stock=1)
+    a = login(MEMBER_A[0])
+    add(a, LAST)
+    summary = checkout(a)
+    sql("UPDATE reservation SET expires_at = NOW() - INTERVAL 1 SECOND WHERE sku_id = :s AND status = 'ACTIVE'", s=LAST)
+    b = login(MEMBER_B[0])
+    add(b, LAST)
+    res = order(a, summary)
+    check("TC-IT-EX-03", "409 で、足りない SKU を示す", res.status_code == 409 and LAST in res.text, res.text)
+    check("TC-IT-EX-03", "在庫は変わらない", stock(LAST) == 1, stock(LAST))
+
+
+def main() -> None:
+    print("注文確定の結合テスト（Azure MySQL に接続して実行）")
+    try:
+        scenario_success()
+        scenario_idempotency()
+        scenario_decline()
+        scenario_timeout()
+        scenario_expiry()
+    finally:
+        restore()
+
+    passed = sum(ok for _, ok in results)
+    print(f"\n{passed}/{len(results)} 件合格")
+    if passed != len(results):
+        print("不合格の項目があります。上の ✘ を確認してください。")
+
+
+if __name__ == "__main__":
+    main()
