@@ -197,6 +197,9 @@ class Checkout(Base):
     recipient_address: Mapped[str | None] = mapped_column(String(200), nullable=True)
     recipient_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     payment_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 確認画面を出した時点の冪等キーと注文内容（db/migrate_002_summary_binding.sql）
+    summary_idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, server_default=func.now())
 
 

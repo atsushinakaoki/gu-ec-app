@@ -39,10 +39,21 @@ async function proxy(
   // 「注文を確定する」POST を送らせる攻撃が成り立ちうる（CSRF）。
   // SameSite=Lax の Cookie はそれを大部分防ぐが、それだけに頼らず、
   // 状態を変える要求は自分のオリジンから来たものに限る。
+  //
+  // Origin ヘッダが無い要求も拒否する（Gemini の指摘）。当初は
+  // 「Origin があって、かつ違う場合」だけを拒否しており、Origin の無い要求は素通りしていた。
+  // 現在のブラウザは、同じオリジンからの fetch による POST にも Origin を付けるので、
+  // 正当な利用者の操作はこれで妨げられない。
   if (!SAFE_METHODS.has(req.method)) {
     const origin = req.headers.get("origin");
     const host = req.headers.get("host");
-    if (origin && host && new URL(origin).host !== host) {
+    let sameOrigin = false;
+    try {
+      sameOrigin = !!origin && !!host && new URL(origin).host === host;
+    } catch {
+      sameOrigin = false; // Origin が URL として読めない
+    }
+    if (!sameOrigin) {
       return NextResponse.json(
         { error: { code: "CSRF_REJECTED", message: "不正な要求です", details: null } },
         { status: 403 },

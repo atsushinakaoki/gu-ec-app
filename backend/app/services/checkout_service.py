@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Cart, CartItem, Checkout, Member, Product, Sku
+from app.models import Cart, CartItem, Checkout, Member, Order, Product, Sku
 from app.services import payment_policy, pricing
 from app.services.errors import CheckoutIncompleteError, ValidationError
 from app.services.fingerprint import FingerprintLine, compute_fingerprint
@@ -315,3 +316,29 @@ def build_draft(db: Session, member: Member, cart: Cart, now: dt.datetime) -> Or
         fingerprint=fingerprint,
         notices=notices,
     )
+
+
+def issue_summary_key(db: Session, cart: Cart, draft: OrderDraft) -> str:
+    """確認画面の冪等キーを発行し、その時点の注文内容（fingerprint）と結び付けて保存する。
+
+    注文確定では、このキーと fingerprint の両方が一致することを要求する
+    （order_service.create_order）。確認画面で見せた内容以外は注文させない。
+
+    内容が前回の確認画面から変わっておらず、そのキーでまだ注文していなければ、
+    同じキーを返す。画面の再読み込みや、開発時に React が画面を2回描画する
+    場合に、キーが入れ替わって「内容が変更されました」と誤って止まるのを防ぐ。
+    すでに注文に使ったキー（決済が否決された場合など）は使い回さない。
+    使い回すと、再試行が前回の否決をそのまま返し続ける。
+    """
+    checkout = get_or_create_checkout(db, cart)
+    key = checkout.summary_idempotency_key
+    reusable = (
+        key is not None
+        and checkout.summary_fingerprint == draft.fingerprint
+        and db.execute(select(Order.order_id).where(Order.idempotency_key == key)).first() is None
+    )
+    if not reusable:
+        key = uuid.uuid4().hex
+    checkout.summary_idempotency_key = key
+    checkout.summary_fingerprint = draft.fingerprint
+    return key

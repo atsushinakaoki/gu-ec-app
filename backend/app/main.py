@@ -8,13 +8,16 @@ routers は HTTP を知らず、services はドメインの言葉で例外を投
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.db import engine
+from app.db import SessionLocal, engine
 from app.routers import auth, cart, checkout, orders, products
 from app.services.errors import (
     AmountMismatchError,
@@ -34,10 +37,54 @@ from app.services.errors import (
 
 logger = logging.getLogger("gu_ec")
 
+
+# --- 決済待ちの注文の定期照会 -------------------------------------------
+#
+# ChatGPT のレビューで指摘された欠陥への対処。決済の応答が得られなかった注文は、
+# 以前は利用者が注文の画面を開いたときにしか照会していなかった。
+# 開かなければ、否決された注文の在庫が永久に戻らない。
+#
+# 同じプロセスの中で定期的に照会する。別プロセスのバッチにしないのは、
+# 決済代行のスタブが PSP 側の記録をプロセスの中に持っているため。
+# 本物の PSP に接続する場合は、外部のジョブや PSP からの通知（webhook）に置き換える。
+#
+# 照会の間隔（既定5分）は設計仕様書 4.5 の未確定事項（テスト仕様書【未確定14】）。
+
+RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))
+RECONCILE_MIN_AGE_SECONDS = int(os.getenv("RECONCILE_MIN_AGE_SECONDS", "60"))
+
+
+def _reconcile_loop(stop: threading.Event) -> None:
+    from app.services.order_service import reconcile_pending_orders
+
+    while not stop.wait(RECONCILE_INTERVAL_SECONDS):
+        db = SessionLocal()
+        try:
+            counts = reconcile_pending_orders(db, RECONCILE_MIN_AGE_SECONDS)
+            if counts:
+                logger.info("決済待ちの注文を照会しました: %s", counts)
+        except Exception:
+            logger.error("定期照会に失敗しました", exc_info=True)
+        finally:
+            db.close()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    stop = threading.Event()
+    worker = None
+    if RECONCILE_INTERVAL_SECONDS > 0:
+        worker = threading.Thread(target=_reconcile_loop, args=(stop,), daemon=True)
+        worker.start()
+    yield
+    stop.set()
+
+
 app = FastAPI(
     title="GUオンラインストア API",
     description="tech0 Step4 Lv3 個人課題。設計仕様書 6章に対応する。",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # フロントエンド（Next.js）からの呼び出しを許可する。

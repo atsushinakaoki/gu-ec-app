@@ -292,6 +292,8 @@ CREATE TABLE checkout (
   recipient_address      VARCHAR(200)  NULL,
   recipient_phone        VARCHAR(20)   NULL,
   payment_method         VARCHAR(20)   NULL COMMENT 'CREDIT_CARD / PAYPAY / D_BARAI / DEFERRED / COD',
+  summary_idempotency_key VARCHAR(64)  NULL COMMENT '確認画面で発行した冪等キー（migrate_002）',
+  summary_fingerprint    VARCHAR(64)   NULL COMMENT '確認画面を出した時点の注文内容のハッシュ値（migrate_002）',
   updated_at             DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
                                        ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (cart_id),

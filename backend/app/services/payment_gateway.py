@@ -22,6 +22,11 @@ PSP 側には「本当の結果」が存在する。後から照会（inquire）
   timeout_then_success    応答なし。照会すると成立していた
   timeout_then_decline    応答なし。照会すると否決されていた
 
+照会（inquire）の応答は PSP_STUB_INQUIRY で切り替える。
+
+  answer   （既定）PSP 側の本当の結果を返す
+  timeout  照会にも応答しない（TC-IT-TO-04。決済待ちが続く状態を作る）
+
 要求の内容（ヘッダ等）で切り替えられるようにはしない。
 それを許すと、本番のコードに「外部から決済結果を操作できる口」が残る。
 テスト仕様書【未確定26】（テスト用の制御点を本番のコードに設けることの是非）に
@@ -99,6 +104,8 @@ def charge(order_number: str, amount: int, payment_method: str) -> PaymentResult
 
 def inquire(order_number: str) -> PaymentResult:
     """取引の状態を照会する（DS-449）。"""
+    if os.getenv("PSP_STUB_INQUIRY", "answer").lower() == "timeout":
+        return PaymentResult(TIMEOUT)
     with _lock:
         result = _ledger.get(order_number)
     if result is None:

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
-
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -159,9 +157,15 @@ def select_payment(
 def get_summary(
     db: Session = Depends(get_db), member: Member = Depends(require_member)
 ) -> CheckoutSummaryResponse:
-    cart, _ = get_or_create_cart(db, member, None)
-    db.commit()
-    draft = checkout_service.build_draft(db, member, cart, get_db_now(db))
+    try:
+        cart, _ = get_or_create_cart(db, member, None)
+        draft = checkout_service.build_draft(db, member, cart, get_db_now(db))
+        # DS-627: 冪等キーはここで発行する。いま見せる内容と結び付けて保存する
+        idempotency_key = checkout_service.issue_summary_key(db, cart, draft)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     items = [
         SummaryItem(
@@ -214,6 +218,5 @@ def get_summary(
             methodName=checkout_service.PAYMENT_NAMES[draft.payment_method],
         ),
         notices=[Notice(**n) for n in draft.notices],
-        # DS-627: 冪等キーはここで発行する。注文確定の要求にこれを付けてもらう
-        idempotencyKey=uuid.uuid4().hex,
+        idempotencyKey=idempotency_key,
     )

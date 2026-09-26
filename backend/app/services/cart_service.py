@@ -32,6 +32,24 @@ reservation をロックしても、これから INSERT される行は存在し
 在庫を減らさない（カート投入では stock.quantity を触らない）のに
 stock 行をロックするのは奇妙に見えるが、ここでは stock 行を
 「その SKU の在庫に関する操作の門」として使っている。
+
+--- カートの行もロックする（レビューを受けて追加） ---
+
+在庫の門だけでは足りなかった。Gemini と ChatGPT のレビューが独立に
+同じ欠陥を指摘し、実際に再現した。
+
+  同じカートに、同じ商品を2つの要求が同時に投入する
+  → 両方が「まだ明細は無い」と判定してから在庫の門に並ぶ
+  → 明細が2行できる。1明細10点の上限も素通りする
+  → 既存の明細に足す場合は、片方の数量の更新がもう片方に上書きされ、
+     画面では9点なのに引当は14点、という状態になる
+
+在庫の門が守るのは「在庫の数」であって、「カートの形」ではない。
+カートの形（どの明細が何点あるか、明細数の上限）を守るには、
+カートそのものを直列化の単位にする必要がある。
+
+ロックの順序は、全経路で「カート → 在庫」に揃える。
+逆の順序で取る経路が1つでもあると、デッドロックになる。
 """
 
 from __future__ import annotations
@@ -41,6 +59,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import config
@@ -53,7 +72,7 @@ from app.services.errors import (
     ValidationError,
 )
 from app.services.reservation import ReservationState
-from app.services.stock import STATUS_ACTIVE, can_reserve
+from app.services.stock import STATUS_ACTIVE, STATUS_CONFIRMED, can_reserve
 
 MAX_QUANTITY_PER_ITEM = 10  # schema.sql の chk_cart_item_quantity と対応
 MAX_ITEMS_PER_CART = 100
@@ -79,9 +98,19 @@ def get_or_create_cart(
             select(Cart).where(Cart.member_id == member.member_id)
         ).scalar_one_or_none()
         if cart is None:
-            cart = Cart(member_id=member.member_id)
-            db.add(cart)
-            db.flush()
+            # 同じ会員の要求が同時に届くと、両方が「カートが無い」と判定して
+            # 両方が作ろうとする。UNIQUE 制約で片方は失敗するが、それを
+            # 500 エラーとして利用者に返してはならない（ChatGPT の指摘）。
+            # セーブポイントで失敗だけを巻き戻し、先に作られたカートを使う。
+            try:
+                with db.begin_nested():
+                    cart = Cart(member_id=member.member_id)
+                    db.add(cart)
+                    db.flush()
+            except IntegrityError:
+                cart = db.execute(
+                    select(Cart).where(Cart.member_id == member.member_id)
+                ).scalar_one()
         return cart, None
 
     if session_id:
@@ -96,6 +125,18 @@ def get_or_create_cart(
     db.add(cart)
     db.flush()
     return cart, new_session_id
+
+
+def lock_cart(db: Session, cart: Cart) -> Cart:
+    """カートの行に排他ロックをかける。
+
+    カートの中身を読んで、それをもとに書き換える操作は、すべてこれを最初に呼ぶ。
+    投入・削除・統合・注文確定がこれにあたる。
+    同じカートへの操作は、ここで一列に並ぶ。
+    """
+    return db.execute(
+        select(Cart).where(Cart.cart_id == cart.cart_id).with_for_update()
+    ).scalar_one()
 
 
 # --- カートの統合 -------------------------------------------------------
@@ -136,10 +177,15 @@ def merge_guest_cart(db: Session, member: Member, session_id: str | None) -> lis
     ).scalar_one_or_none()
 
     if member_cart is None:
+        lock_cart(db, guest)
         guest.member_id = member.member_id
         guest.session_id = None
         db.flush()
         return []
+
+    # 2つのカートをロックする。順序は cart_id の小さい方から（デッドロックの回避）
+    for c in sorted([guest, member_cart], key=lambda c: c.cart_id):
+        lock_cart(db, c)
 
     member_items = list(
         db.execute(select(CartItem).where(CartItem.cart_id == member_cart.cart_id)).scalars()
@@ -211,6 +257,11 @@ def add_item(
     if sku is None:
         raise NotFoundError(f"SKUが見つかりません: {sku_id}")
 
+    # 明細の有無を調べる前に、カートをロックする。
+    # 調べてからロックすると、同時に来た要求どうしが同じ「まだ無い」を見て、
+    # それぞれが明細を作ってしまう（レビューで指摘され、再現した欠陥）。
+    lock_cart(db, cart)
+
     product = db.get(Product, sku.product_id)
     if product is None:
         raise NotFoundError(f"商品が見つかりません: {sku.product_id}")
@@ -230,6 +281,12 @@ def add_item(
     # 同じ SKU でも、丈が違えば別物として扱う。
     # SKU だけで同一と見なすと、シングル仕上げとダブル仕上げが
     # 1明細に統合されてしまい、どちらで加工すべきか決まらなくなる。
+    # 決済待ちの注文に含まれる明細（確定済みの引当を持つ明細）には足さない。
+    # 足すと、決済が成立した時点でその明細ごとカートから消え、
+    # 後から足した分の引当が持ち主のいないまま在庫を塞ぐ。
+    in_flight = select(Reservation.cart_item_id).where(
+        Reservation.status == STATUS_CONFIRMED, Reservation.cart_item_id.is_not(None)
+    )
     existing = db.execute(
         select(CartItem).where(
             CartItem.cart_id == cart.cart_id,
@@ -240,8 +297,9 @@ def add_item(
             CartItem.alteration_length_mm.is_(alteration_length_mm)
             if alteration_length_mm is None
             else CartItem.alteration_length_mm == alteration_length_mm,
+            CartItem.cart_item_id.not_in(in_flight),
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
 
     if existing is None:
         item_count = len(

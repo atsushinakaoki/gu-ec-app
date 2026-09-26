@@ -207,6 +207,7 @@ def delete_cart_item(
     gu_cart_session: str | None = Cookie(default=None, alias=CART_SESSION_COOKIE),
 ) -> Response:
     cart, _ = cart_service.get_or_create_cart(db, member, gu_cart_session)
+    cart_service.lock_cart(db, cart)  # 注文確定や投入と同時に走っても、カートの形を崩さない
 
     item = db.get(CartItem, cart_item_id)
     # 他人のカートの明細を、IDを推測して削除できてはならない。

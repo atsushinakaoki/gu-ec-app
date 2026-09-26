@@ -91,6 +91,7 @@ def reset(last_stock: int = 1) -> None:
     sql("UPDATE stock SET quantity = :q WHERE sku_id = :s AND location_id = 1", q=last_stock, s=LAST)
     payment_gateway.reset()
     os.environ["PSP_STUB_MODE"] = "success"
+    os.environ["PSP_STUB_INQUIRY"] = "answer"
 
 
 def restore() -> None:
@@ -229,11 +230,11 @@ def scenario_idempotency() -> None:
     a = login(MEMBER_A[0])
     add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 700})
     summary = checkout(a)
-    res = order(a, summary, key="it-id04-key")
+    res = order(a, summary)
     assert res.status_code == 201, res.text
     add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 650})  # 金額は同じ、丈だけ違う
     checkout(a)
-    res = order(a, summary, key="it-id04-key")
+    res = order(a, summary)  # 1件目と同じキー
     check("TC-IT-ID-04", "同じキー・異なる内容は 422", res.status_code == 422, res.text)
 
     # ID-05: 違うキー・同じ内容
@@ -331,8 +332,14 @@ def scenario_timeout() -> None:
             check("TC-IT-TO-01", "在庫は減ったまま", stock(PANTS) == before - 2)
             check("TC-IT-TO-01", "注文は PENDING_PAYMENT", orders_count(1, "PENDING_PAYMENT") == 1)
             check("TC-IT-TO-01", "引当は CONFIRMED のまま", reservation_statuses(number) == ["CONFIRMED"], reservation_statuses(number))
-            blocked = a.post("/api/orders", json={"expectedTotal": 1}, headers={"Idempotency-Key": "another"})
-            check("【未確定13】", "決済待ちの間は新しい注文を受け付けない（暫定）", blocked.status_code == 409, blocked.text)
+            # 注文を始める時点で照会を試みるので、照会にも応答しない状態にして確かめる
+            os.environ["PSP_STUB_INQUIRY"] = "timeout"
+            try:
+                blocked = a.post("/api/orders", json={"expectedTotal": 1}, headers={"Idempotency-Key": "another"})
+                check("【未確定13】", "決済待ちの間は新しい注文を受け付けない（暫定）", blocked.status_code == 409, blocked.text)
+                check("TC-IT-TO-04", "照会も応答しなければ決済待ちのまま", orders_count(1, "PENDING_PAYMENT") == 1)
+            finally:
+                os.environ["PSP_STUB_INQUIRY"] = "answer"
         detail = a.get(f"/api/orders/{number}").json()
         expected_stock = before - 2 if final == "CONFIRMED" else before
         check(test_id, f"照会の結果、注文が {final} になる", detail.get("status") == final, detail)
@@ -412,6 +419,227 @@ def scenario_merge() -> None:
     check("DS-427", "ログインで引当期限を延ばさない", after == guest_expiry, (guest_expiry, after))
 
 
+def race(*fns):
+    """渡した関数を、できるだけ同時に実行する。"""
+    barrier = threading.Barrier(len(fns))
+    out = [None] * len(fns)
+
+    def run(i, fn):
+        barrier.wait()
+        out[i] = fn()
+
+    threads = [threading.Thread(target=run, args=(i, fn)) for i, fn in enumerate(fns)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def scenario_review_findings() -> None:
+    """Gemini と ChatGPT のコードレビューで見つかった欠陥の再発防止。
+
+    どれも、指摘を受けて実際に再現させた手順をそのままテストにしたもの。
+    タイミングに依存するため、何回か繰り返す。
+    """
+    print("\nレビュー指摘の再発防止")
+
+    # --- Gemini-1 / ChatGPT-4：同じカートへの同時投入 ---
+    ok_new, ok_add = 0, 0
+    detail = []
+    for _ in range(5):
+        reset()
+        a1 = login(MEMBER_A[0])
+        a2 = login(MEMBER_A[0])  # 同じ会員＝同じカート
+        codes = race(
+            lambda: a1.post("/api/cart/items", json={"skuId": PLENTY, "quantity": 6}).status_code,
+            lambda: a2.post("/api/cart/items", json={"skuId": PLENTY, "quantity": 6}).status_code,
+        )
+        lines = [(i["quantity"]) for i in a1.get("/api/cart").json()["items"] if i["skuId"] == PLENTY]
+        reserved = scalar(
+            "SELECT COALESCE(SUM(quantity),0) FROM reservation WHERE sku_id=:s AND status='ACTIVE'", s=PLENTY
+        )
+        ok_new += lines == [6] and reserved == 6 and sorted(codes) == [201, 400]
+        detail.append((sorted(codes), lines, reserved))
+
+        reset()
+        a1, a2 = login(MEMBER_A[0]), login(MEMBER_A[0])
+        add(a1, PLENTY, 4)
+        codes = race(
+            lambda: a1.post("/api/cart/items", json={"skuId": PLENTY, "quantity": 5}).status_code,
+            lambda: a2.post("/api/cart/items", json={"skuId": PLENTY, "quantity": 5}).status_code,
+        )
+        lines = [(i["quantity"]) for i in a1.get("/api/cart").json()["items"] if i["skuId"] == PLENTY]
+        reserved = scalar(
+            "SELECT COALESCE(SUM(quantity),0) FROM reservation WHERE sku_id=:s AND status='ACTIVE'", s=PLENTY
+        )
+        ok_add += lines == [9] and reserved == 9 and sorted(codes) == [201, 400]
+        detail.append((sorted(codes), lines, reserved))
+    check("Gemini-1", "同時投入でも明細は1行・10点の上限を守る（5回）", ok_new == 5, detail[0::2])
+    check("Gemini-1", "既存明細への同時追加で、明細の数量と引当が一致する（5回）", ok_add == 5, detail[1::2])
+
+    # --- ChatGPT-1：2つのタブから同時に注文 ---
+    ok = 0
+    detail = []
+    for variant in ("同じ内容の確認画面", "片方が支払方法を変えた後"):
+        for _ in range(3):
+            reset()
+            a, b = login(MEMBER_A[0]), login(MEMBER_A[0])
+            add(a, PANTS, 2)
+            before = stock(PANTS)
+            sa = checkout(a)
+            if variant == "同じ内容の確認画面":
+                sb = b.get("/api/checkout/summary").json()
+            else:
+                b.post("/api/checkout/payment", json={"paymentMethod": "PAYPAY"})
+                sb = b.get("/api/checkout/summary").json()
+            codes = race(lambda: order(a, sa).status_code, lambda: order(b, sb).status_code)
+            charges = len(payment_gateway.calls())
+            good = orders_count(1) == 1 and charges == 1 and stock(PANTS) == before - 2 and 201 in codes
+            ok += good
+            detail.append((variant, sorted(codes), orders_count(1), charges, before - stock(PANTS)))
+    check("ChatGPT-1", "2タブから同時に注文しても、注文1件・決済1回・減算1回（6回）", ok == 6, detail)
+
+    # --- ChatGPT-2：否決が判明した注文を同時に照会 ---
+    ok = 0
+    detail = []
+    for _ in range(3):
+        reset()
+        a = login(MEMBER_A[0])
+        add(a, PANTS, 2)
+        before = stock(PANTS)
+        summary = checkout(a)
+        os.environ["PSP_STUB_MODE"] = "timeout_then_decline"
+        number = order(a, summary).json()["orderNumber"]
+        a2 = login(MEMBER_A[0])
+        race(lambda: a.get(f"/api/orders/{number}").status_code, lambda: a2.get(f"/api/orders/{number}").status_code)
+        ok += stock(PANTS) == before
+        detail.append((before, stock(PANTS)))
+    check("ChatGPT-2", "同時に照会しても、在庫は1回だけ戻る（3回）", ok == 3, detail)
+
+    # --- ChatGPT-3：確認画面の後に、同額のまま中身を差し替える ---
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 700})
+    summary = checkout(a)
+    item = a.get("/api/cart").json()["items"][0]["cartItemId"]
+    a.delete(f"/api/cart/items/{item}")
+    add(a, PANTS, 1, {"type": "SINGLE_FOLD", "lengthMm": 650})
+    res = order(a, summary)
+    check("ChatGPT-3", "確認画面と中身が違えば、同額でも注文させない（422）", res.status_code == 422, res.text)
+    check("ChatGPT-3", "注文は作られない", orders_count(1) == 0)
+
+    # --- ChatGPT-5：注文確定と同時に、同じ明細へ追加する ---
+    ok = 0
+    detail = []
+    for _ in range(5):
+        reset()
+        a, a2 = login(MEMBER_A[0]), login(MEMBER_A[0])
+        add(a, PANTS, 1)
+        before = stock(PANTS)
+        summary = checkout(a)
+        codes = race(
+            lambda: order(a, summary).status_code,
+            lambda: a2.post("/api/cart/items", json={"skuId": PANTS, "quantity": 1}).status_code,
+        )
+        ordered = scalar(
+            "SELECT COALESCE(SUM(oi.quantity),0) FROM order_item oi JOIN orders o ON o.order_id=oi.order_id WHERE o.member_id=1"
+        )
+        confirmed = scalar(
+            "SELECT COALESCE(SUM(r.quantity),0) FROM reservation r JOIN orders o ON o.order_id=r.order_id WHERE o.member_id=1 AND r.status='CONFIRMED'"
+        )
+        cart_qty = sum(i["quantity"] for i in a.get("/api/cart").json()["items"])
+        # カート明細に結び付いた引当だけでなく、その商品の有効な引当をすべて数える。
+        # 明細から切り離された「持ち主のいない引当」も在庫を塞ぐので、見逃してはならない。
+        # （最初の版はカート明細とつないで数えており、変異テストでこの見逃しが判明した）
+        active = scalar(
+            "SELECT COALESCE(SUM(quantity),0) FROM reservation WHERE sku_id=:s AND status='ACTIVE'", s=PANTS
+        )
+        good = ordered == confirmed == before - stock(PANTS) and cart_qty == active
+        ok += good
+        detail.append((sorted(codes), ordered, confirmed, before - stock(PANTS), cart_qty, active))
+    check("ChatGPT-5", "注文と追加が重なっても、注文・引当・在庫・カートが一致する（5回）", ok == 5, detail)
+
+    # --- ChatGPT-5（確定的な再現）：決済待ちの明細へ、同じ商品を追加する ---
+    # 上の同時実行テストは、追加が先に勝つ回が多く、欠陥の経路を通らないことがある
+    # （修正を外しても検出できない回があった）。決済待ちの状態を先に作り、順番を固定して確かめる。
+    from app.db import SessionLocal
+    from app.services.order_service import reconcile_pending_orders
+
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 1)
+    summary = checkout(a)
+    os.environ["PSP_STUB_MODE"] = "timeout_then_success"
+    os.environ["PSP_STUB_INQUIRY"] = "timeout"
+    res = order(a, summary)
+    assert res.status_code == 202, res.text
+    add(a, PANTS, 1)  # 決済待ちの明細と同じ商品・同じ内容
+    lines_pending = len(a.get("/api/cart").json()["items"])
+    os.environ["PSP_STUB_INQUIRY"] = "answer"
+    db = SessionLocal()
+    try:
+        reconcile_pending_orders(db, min_age_seconds=0)
+    finally:
+        db.close()
+    cart_qty = sum(i["quantity"] for i in a.get("/api/cart").json()["items"])
+    active = scalar(
+        "SELECT COALESCE(SUM(quantity),0) FROM reservation WHERE sku_id=:s AND status='ACTIVE'", s=PANTS
+    )
+    orphan = scalar(
+        "SELECT COUNT(*) FROM reservation WHERE sku_id=:s AND status='ACTIVE' AND cart_item_id IS NULL", s=PANTS
+    )
+    check("ChatGPT-5", "決済待ちの明細には合算せず、別の明細として追加する", lines_pending == 2, lines_pending)
+    check("ChatGPT-5", "決済が成立した後も、追加した1点がカートに残り、引当と一致する",
+          orders_count(1, "CONFIRMED") == 1 and cart_qty == 1 and active == 1 and orphan == 0,
+          (orders_count(1, "CONFIRMED"), cart_qty, active, orphan))
+
+    # --- ChatGPT-6：利用者が画面を開かなくても、決済待ちが解消される ---
+    from app.db import SessionLocal
+    from app.services.order_service import reconcile_pending_orders
+
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PANTS, 2)
+    before = stock(PANTS)
+    summary = checkout(a)
+    os.environ["PSP_STUB_MODE"] = "timeout_then_decline"
+    order(a, summary)
+    db = SessionLocal()
+    try:
+        counts = reconcile_pending_orders(db, min_age_seconds=0)
+    finally:
+        db.close()
+    check("ChatGPT-6", "定期照会で、否決された注文が FAILED になり在庫が戻る",
+          orders_count(1, "FAILED") == 1 and stock(PANTS) == before, (counts, before, stock(PANTS)))
+
+    # --- ChatGPT-7：会員のカートを同時に初めて作る ---
+    ok = 0
+    for _ in range(3):
+        sql("DELETE FROM cart_item WHERE cart_id IN (SELECT cart_id FROM cart WHERE member_id = 2)")
+        sql("DELETE FROM checkout WHERE cart_id IN (SELECT cart_id FROM cart WHERE member_id = 2)")
+        sql("DELETE FROM cart WHERE member_id = 2")
+        b1, b2 = login(MEMBER_B[0]), login(MEMBER_B[0])
+        codes = race(lambda: b1.get("/api/cart").status_code, lambda: b2.get("/api/cart").status_code)
+        ok += codes == [200, 200] and scalar("SELECT COUNT(*) FROM cart WHERE member_id = 2") == 1
+    check("ChatGPT-7", "会員カートの同時作成でもエラーにならない（3回）", ok == 3)
+
+    # --- Gemini-4：決済待ちの間に価格が変わっても、再送には「処理中」を返す ---
+    reset()
+    a = login(MEMBER_A[0])
+    add(a, PLENTY, 1)
+    summary = checkout(a)
+    os.environ["PSP_STUB_MODE"] = "timeout_then_success"
+    os.environ["PSP_STUB_INQUIRY"] = "timeout"
+    order(a, summary)
+    sql("UPDATE product SET regular_price = regular_price + 100 WHERE product_id = '360416'")
+    try:
+        res = order(a, summary)
+        check("Gemini-4", "決済待ちの注文への再送は、内容の比較より先に 409", res.status_code == 409, res.text)
+    finally:
+        sql("UPDATE product SET regular_price = regular_price - 100 WHERE product_id = '360416'")
+
+
 def main() -> None:
     print("注文確定の結合テスト（Azure MySQL に接続して実行）")
     try:
@@ -421,6 +649,7 @@ def main() -> None:
         scenario_timeout()
         scenario_expiry()
         scenario_merge()
+        scenario_review_findings()
     finally:
         restore()
 

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import secrets
 from collections import defaultdict
@@ -35,7 +36,7 @@ from app import config
 from app.models import Cart, CartItem, Checkout, Member, Order, OrderItem, Reservation, Stock
 from app.services import payment_gateway, payment_policy
 from app.services.availability import get_db_now
-from app.services.cart_service import get_or_create_cart
+from app.services.cart_service import get_or_create_cart, lock_cart
 from app.services.checkout_service import OrderDraft, build_draft
 from app.services.errors import (
     CheckoutIncompleteError,
@@ -110,6 +111,13 @@ def _replay(db: Session, member: Member, existing: Order, cart: Cart) -> OrderOu
     if existing.member_id != member.member_id:
         # 他人の冪等キー。存在を示さないため、内容の不一致と同じ応答にする
         raise ConflictError("この注文は受け付けられません。確認画面を再表示してください")
+
+    # 決済待ちの注文は、内容の比較より先に「処理中」を返す（Gemini の指摘）。
+    # 比較を先にすると、決済待ちの間に商品の価格が変わっただけで fingerprint が
+    # 一致しなくなり、「内容が変更されました。確認画面から注文し直してください」と
+    # 案内してしまう。処理中の注文があるのに、注文し直しを促すのは誤りである。
+    if existing.status == STATUS_PENDING:
+        raise OrderInProgressError("この注文は処理中です。しばらくしてから注文状況をご確認ください")
 
     # --- 判定の順序について ---
     #
@@ -311,10 +319,30 @@ class _DuplicateKey(Exception):
 # --- 4. 決済の結果に応じた後処理 ----------------------------------------
 
 
+def _lock_order(db: Session, order_id: int) -> Order:
+    """注文の行に排他ロックをかけ、最新の状態を読み直す。
+
+    決済の後処理（確定・補償）は、必ずこれを通してから状態を確かめる。
+    """
+    return db.execute(
+        select(Order)
+        .where(Order.order_id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+
 def _finalize_success(db: Session, order: Order, transaction_id: str) -> None:
-    """トランザクション②：注文を確定し、注文した明細をカートから消す。"""
+    """トランザクション②：注文を確定し、注文した明細をカートから消す。
+
+    注文の行をロックし、まだ決済待ちの場合だけ処理する。
+    照会と注文確定の応答処理が同時に走っても、確定は1回しか起きない。
+    """
     try:
-        order = db.get(Order, order.order_id)
+        order = _lock_order(db, order.order_id)
+        if order.status != STATUS_PENDING:
+            db.rollback()
+            return
         order.status = STATUS_ORDER_CONFIRMED
         order.payment_transaction_id = transaction_id
 
@@ -347,9 +375,25 @@ def _compensate(db: Session, order: Order) -> None:
     """補償処理：在庫を戻し、引当を解放し、注文を FAILED にする（DS-445）。
 
     カートは消さない（DS-447）。支払方法を変えて再試行できるようにする。
+
+    --- 冪等にする理由（ChatGPT の指摘。再現を確認） ---
+
+    否決が判明した注文を、2つの要求が同時に照会すると、両方が
+    「まだ決済待ち」を読んでから補償に入る。在庫の行はロックしていたが、
+    ロックを取った後に「この注文の補償はまだか」を確かめていなかったため、
+    在庫が2回戻された。在庫40 → 注文で38 → 補償で40 → 二重補償で42。
+    実在しない在庫が2点生まれ、そのまま売り越しにつながる。
+
+    注文の行をロックしてから状態を確かめ、決済待ちのときだけ補償する。
+    2つ目の要求は、ロックが解けた時点で FAILED を読み、何もせずに戻る。
+    ロックの順序は「注文 → 在庫」。
     """
     try:
-        order = db.get(Order, order.order_id)
+        order = _lock_order(db, order.order_id)
+        if order.status != STATUS_PENDING:
+            db.rollback()
+            return
+
         items = list(
             db.execute(select(OrderItem).where(OrderItem.order_id == order.order_id)).scalars()
         )
@@ -390,6 +434,54 @@ def _compensate(db: Session, order: Order) -> None:
         raise
 
 
+def reconcile(db: Session, order: Order) -> str:
+    """決済待ちの注文を PSP に照会し、結果に応じて確定または補償する（DS-449）。
+
+    戻り値は照会後の注文の状態。照会しても結果が分からなければ PENDING のまま。
+    注文確定・注文の閲覧・定期照会のどこから呼ばれても、結果は1回しか反映されない
+    （_finalize_success と _compensate が注文の行をロックして状態を確かめるため）。
+    """
+    if order.status != STATUS_PENDING:
+        return order.status
+    result = payment_gateway.inquire(order.order_number)
+    if result.status == payment_gateway.SUCCEEDED:
+        _finalize_success(db, order, result.transaction_id)
+    elif result.status == payment_gateway.DECLINED:
+        _compensate(db, order)
+    # 照会も応答しなければ何もしない（TC-IT-TO-04）
+    return db.execute(
+        select(Order.status).where(Order.order_id == order.order_id)
+    ).scalar_one()
+
+
+def reconcile_pending_orders(db: Session, min_age_seconds: int = 60) -> dict[str, int]:
+    """決済待ちのまま一定時間が経った注文を、まとめて照会する。
+
+    ChatGPT の指摘への対処。以前は、利用者が注文の画面を開いたときにしか
+    照会していなかった。利用者が二度と開かなければ、否決された注文の在庫が
+    減ったまま永久に戻らず、その会員は新しい注文もできなくなる。
+
+    main.py の定期処理から呼ぶ。照会の間隔は設計仕様書 4.5 の未確定事項
+    （テスト仕様書【未確定14】）であり、既定の5分は暫定値である。
+    """
+    now = get_db_now(db)
+    threshold = now - dt.timedelta(seconds=min_age_seconds)
+    targets = list(
+        db.execute(
+            select(Order).where(Order.status == STATUS_PENDING, Order.ordered_at <= threshold)
+        ).scalars()
+    )
+    counts: dict[str, int] = defaultdict(int)
+    for order in targets:
+        try:
+            counts[reconcile(db, order)] += 1
+        except Exception:
+            db.rollback()
+            counts["ERROR"] += 1
+            logger.error("定期照会に失敗: order=%s", order.order_number, exc_info=True)
+    return dict(counts)
+
+
 # --- 公開する関数 -------------------------------------------------------
 
 
@@ -407,20 +499,63 @@ def create_order(
     if existing is not None:
         return _replay(db, member, existing, cart)
 
+    # 決済待ちの注文があれば、まず照会して結果を確定させてみる。
+    # 結果が分かれば、利用者は待たずに次の注文へ進める。
+    # カートのロックより前に行う。照会の後処理は「注文 → カート明細」の順で
+    # 触るので、カートを押さえたまま照会すると、ロックの順序が逆転する。
+    for pending_order in db.execute(
+        select(Order).where(Order.member_id == member.member_id, Order.status == STATUS_PENDING)
+    ).scalars().all():
+        reconcile(db, pending_order)
+
+    # --- ここから、このカートに対する操作を一列に並べる ---
+    #
+    # ChatGPT の指摘（再現を確認）：2つのタブから別々の冪等キーでほぼ同時に
+    # 注文すると、同じカートから注文が2件でき、決済も2回走っていた。
+    # 在庫のロックは取っていたが、同じ冪等キーの重複しか確かめていなかったため、
+    # キーが違う2件目は素通りしていた。
+    #
+    # カートの行をロックしてから、決済待ちの有無の確認・注文内容の組み立て・
+    # 在庫の確定までを行う。2件目は、1件目のトランザクションが終わるまで待ち、
+    # 決済待ちの注文（1件目）を見つけて止まる。
+    #
+    # 注文内容の組み立てもロックの内側に置く。外に置くと、組み立てた後に
+    # 別タブでカートの数量が変わり、注文の数量と確定する引当の数量が
+    # 食い違う（ChatGPT の別の指摘）。
+    cart = lock_cart(db, cart)
+
     # 決済の結果が未確定の注文がある間は、新しい注文を受け付けない。
     # その注文の引当は CONFIRMED のままカートに残っている（【未確定13】）。
-    # ここで次の注文を通すと、同じ商品で二重に注文が成立しうる。
     pending = db.execute(
         select(Order.order_number).where(
             Order.member_id == member.member_id, Order.status == STATUS_PENDING
         )
     ).first()
     if pending is not None:
+        db.rollback()
         raise OrderInProgressError(
             "処理中のご注文があります。注文状況をご確認のうえ、しばらくしてからお試しください"
         )
 
     draft = build_draft(db, member, cart, get_db_now(db))
+
+    # --- 確認画面で見せた内容と、いまの注文内容が一致するか ---
+    #
+    # ChatGPT の指摘（再現を確認）：確認画面を開いた後、別タブで中身を
+    # 同額のまま差し替えると（丈 700mm → 650mm など）、古い確認画面から
+    # 押した「注文を確定する」で、差し替え後の内容が注文されていた。
+    # 金額だけを照合していたため、利用者が確認していない内容で注文が成立した。
+    #
+    # 確認画面を出した時点の冪等キーと fingerprint を保存しておき、
+    # 両方が一致しなければ注文させない。
+    checkout = db.get(Checkout, cart.cart_id)
+    if (
+        checkout is None
+        or checkout.summary_idempotency_key != idempotency_key
+        or checkout.summary_fingerprint != draft.fingerprint
+    ):
+        db.rollback()
+        raise ConflictError("ご注文の内容が変更されています。確認画面を再表示してください")
 
     # 配送方法と支払方法の整合を再検証する。
     # 選択後に別タブで配送方法を変えられている可能性がある
@@ -428,11 +563,13 @@ def create_order(
         draft.payment_method, draft.delivery_method, draft.placement_type
     )
     if reason is not None:
+        db.rollback()
         raise CheckoutIncompleteError(reason.message)
 
     # DS-628: Frontend の算出額と照合する。
     # DS-629: 一致しなくても、正しい金額は教えない
     if expected_total != draft.amounts.total:
+        db.rollback()
         raise AmountMismatchError("ご注文の金額が変更されています。確認画面を再表示してください")
 
     # トランザクション①
@@ -481,13 +618,7 @@ def get_order(db: Session, member: Member, order_number: str) -> Order:
         raise NotFoundError("注文が見つかりません")
 
     if order.status == STATUS_PENDING:
-        result = payment_gateway.inquire(order.order_number)
-        if result.status == payment_gateway.SUCCEEDED:
-            _finalize_success(db, order, result.transaction_id)
-        elif result.status == payment_gateway.DECLINED:
-            _compensate(db, order)
-        # 照会も応答しなければ PENDING のまま（TC-IT-TO-04）
-        order = db.get(Order, order.order_id)
+        reconcile(db, order)
         db.refresh(order)
 
     return order
